@@ -432,6 +432,73 @@ func (r *Remote) Connect() error {
 	return nil
 }
 
+// Connect connects to Bluetooth device on remote host
+func (r *Remote) Disconnect() error {
+	client := NewSSHClient(r.sshConfig)
+	if err := client.ConnectWithKeyFile(); err != nil {
+		return err
+	}
+	defer client.Close()
+
+	commands := []string{
+		"select 10:08:B1:B3:29:A2",
+		"power on",
+		"pairable on",
+		"agent on",
+		"default-agent",
+		"disconnect F4:4E:FD:20:4C:A6",
+		"info F4:4E:FD:20:4C:A6",
+		"exit",
+	}
+
+	parser := &Parser{}
+	success := false
+
+	// Execute each command separately like Python version
+	for _, cmd := range commands {
+		fullCmd := fmt.Sprintf("bluetoothctl %s", cmd)
+		log.Debugf("Executing: %s", fullCmd)
+		
+		stdout, stderr, err := client.RunCommand(fullCmd)
+		
+		// Check for success indicators
+		if strings.Contains(stdout, "Disconnected: yes") || 
+		   strings.Contains(stdout, "Disconnection successful") {
+			success = true
+			log.Info("✓ Device disconnected successfully")
+		}
+		
+		if stdout != "" {
+			fmt.Printf("bluecon: %s", stdout)
+			
+			// Try to parse device info from info command
+			if cmd == "info F4:4E:FD:20:4C:A6" {
+				deviceInfo := parser.ParseBluetoothctlOutput(stdout)
+				if deviceInfo.MAC != "" {
+					log.WithField("device_info", deviceInfo).Debug("Device information")
+				}
+			}
+		}
+		
+		if stderr != "" {
+			log.Error(stderr)
+		}
+		
+		if err != nil {
+			log.Debugf("Command error: %v", err)
+		}
+		
+		// Small delay between commands
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	if success {
+		playSound()
+	}
+
+	return nil
+}
+
 // BlueCon handles local Bluetooth operations
 type BlueCon struct{}
 
@@ -563,25 +630,37 @@ func main() {
 	// Command line flags
 	var (
 		remote   = flag.Bool("remote", false, "Execute remotely via SSH")
-		listOnly = flag.Bool("list", false, "List devices instead of connecting")
+		remote_short   = flag.Bool("r", false, "Execute remotely via SSH")
+		disconnect = flag.Bool("disconnect", false, "Disconnecting")
+		disconnect_short = flag.Bool("dis", false, "Disconnecting")
+		connect = flag.Bool("connect", false, "Manual Connecting")
+		connect_short = flag.Bool("con", false, "Disconnecting")
+		listOnly = flag.Bool("list", false, "List devicfes instead of connecting")
+		listOnly_short = flag.Bool("l", false, "List devicfes instead of connecting")
 		hostname = flag.String("hostname", "222.222.222.5", "Remote SSH hostname")
+		hostname_short = flag.String("H", "222.222.222.5", "Remote SSH hostname")
 		username = flag.String("username", "root", "Remote SSH username")
+		username_short = flag.String("U", "root", "Remote SSH username")
 		port     = flag.Int("port", 22, "Remote SSH port")
+		port_short     = flag.Int("p", 22, "Remote SSH port")
 		keyFile  = flag.String("key", defaultKeyPath, "SSH key file full path")
+		keyFile_short  = flag.String("k", defaultKeyPath, "SSH key file full path")
 		debug    = flag.Bool("debug", false, "Enable debug mode")
+		debug_short    = flag.Bool("d", false, "Enable debug mode")
 		showVer  = flag.Bool("version", false, "Show version")
+		showVer_short  = flag.Bool("v", false, "Show version")
 	)
 
 	flag.Parse()
 
 	// Show version
-	if *showVer {
+	if *showVer || *showVer_short {
 		fmt.Printf("BlueCon v%s by %s\n", version, author)
 		os.Exit(0)
 	}
 
 	// Set log level
-	if *debug {
+	if *debug || *debug_short {
 		log.SetLevel(logrus.DebugLevel)
 		log.Debug("🐞 Debug mode enabled")
 	}
@@ -598,15 +677,40 @@ func main() {
 	// Execute based on flags
 	var err error
 
-	if *remote {
-		r := NewRemote(*hostname, *username, *keyFile, *port)
+	if *remote || *remote_short {
+		host := *hostname
+		if host == "" {
+		    host = *hostname_short
+		}
+
+		user := *username
+		if user == "" {
+		    user = *username_short
+		}
+
+		key := *keyFile
+		if key == "" {
+		    key = *keyFile_short
+		}
+
+		port := *port
+		if port == 0 {
+		    port = *port_short
+		}
+
+		r := NewRemote(host, user, key, port)
+
 		if *listOnly {
 			err = r.List()
+		} else if *disconnect || *disconnect_short {
+			err = r.Disconnect()
+		} else if *connect || *connect_short {
+			err = r.Connect()
 		} else {
 			err = r.Connect()
 		}
 	} else {
-		if *listOnly {
+		if *listOnly || *listOnly_short {
 			fmt.Println("Local list not implemented. Use: bluetoothctl devices")
 		} else {
 			// If no arguments, show help and run local
