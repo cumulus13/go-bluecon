@@ -44,15 +44,36 @@ jobs:
       - name: Get version
         id: version
         run: |
-          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+          VERSION=""
+          
+          # Tag push event
+          if [[ -n "$GITHUB_REF" && "$GITHUB_REF" == refs/tags/* ]]; then
             VERSION="${GITHUB_REF#refs/tags/}"
-          elif [[ "${{ github.event.release.tag_name }}" != "" ]]; then
-            VERSION="${{ github.event.release.tag_name }}"
+          
+          # Release event
+          elif [[ "$GITHUB_EVENT_NAME" == "release" && -n "$GITHUB_EVENT_RELEASE_TAG_NAME" ]]; then
+            VERSION="$GITHUB_EVENT_RELEASE_TAG_NAME"
+          
+          # Workflow dispatch (use latest tag or commit hash)
+          elif [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            if git describe --tags --exact-match HEAD 2>/dev/null; then
+              VERSION=$(git describe --tags --exact-match HEAD)
+            else
+              VERSION="dev-$(git rev-parse --short HEAD)"
+            fi
+          
+          # Fallback
           else
             VERSION="dev-$(git rev-parse --short HEAD)"
           fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          
+          # Strip leading 'v' for cleaner filenames (optional)
+          VERSION="${VERSION#v}"
+          
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Building version: $VERSION"
+        env:
+          GITHUB_EVENT_RELEASE_TAG_NAME: ${{ github.event.release.tag_name }}
           
       - name: Build
         env:
@@ -74,15 +95,20 @@ jobs:
           # Build
           go build -v -trimpath -ldflags="-s -w" -o "$BINARY" ./bluecon
           
-          # Verify
+          # Verify binary exists
+          if [ ! -f "$BINARY" ]; then
+            echo "❌ ERROR: Binary not found: $BINARY"
+            exit 1
+          fi
+          
           ls -lh "$BINARY"
           
           # Generate checksum
           sha256sum "$BINARY" > "$BINARY.sha256"
           cat "$BINARY.sha256"
           
-          # Save for next steps
-          echo "BINARY=$BINARY" >> $GITHUB_ENV
+          # Save for artifact upload
+          echo "BINARY=$BINARY" >> "$GITHUB_ENV"
           
       - name: Upload to Artifacts
         uses: actions/upload-artifact@v4
@@ -95,131 +121,152 @@ jobs:
           retention-days: 90
 
   release:
-    name: Create Release
+    name: Create/Update Release
     needs: build
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'release'
+    # FIXED: Proper expression syntax with ${{ }}
+    if: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'release' || github.event_name == 'workflow_dispatch' }}
     
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        
+      - name: Get version
+        id: version
+        run: |
+          VERSION=""
+          
+          if [[ -n "$GITHUB_REF" && "$GITHUB_REF" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+          elif [[ "$GITHUB_EVENT_NAME" == "release" && -n "$GITHUB_EVENT_RELEASE_TAG_NAME" ]]; then
+            VERSION="$GITHUB_EVENT_RELEASE_TAG_NAME"
+          else
+            VERSION="dev-$(git rev-parse --short HEAD)"
+          fi
+          
+          VERSION="${VERSION#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Release version: $VERSION"
+        env:
+          GITHUB_EVENT_RELEASE_TAG_NAME: ${{ github.event.release.tag_name }}
+          
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          path: artifacts
+          path: release-files
+          merge-multiple: true  # CRITICAL: flattens all artifacts into single directory
           
-      - name: Display structure
+      - name: Verify downloaded files
         run: |
-          echo "Artifacts structure:"
-          ls -R artifacts/
-          
-      - name: Prepare release files
-        run: |
-          mkdir -p release-files
-          find artifacts -type f -exec cp {} release-files/ \;
+          echo "📁 Downloaded artifacts:"
           ls -lh release-files/
           
-      - name: Upload to Release
+          if [ ! -d release-files ] || [ -z "$(ls -A release-files/ 2>/dev/null)" ]; then
+            echo "❌ ERROR: No artifacts downloaded!"
+            exit 1
+          fi
+          
+      - name: Create Release (for tag pushes & workflow_dispatch)
         uses: softprops/action-gh-release@v2
+        if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
         with:
-          files: release-files/*
-          fail_on_unmatched_files: true
+          tag_name: v${{ steps.version.outputs.version }}
+          name: Release v${{ steps.version.outputs.version }}
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.version, 'beta') || contains(steps.version.outputs.version, 'rc') || startsWith(steps.version.outputs.version, 'dev-') }}
+          files: |
+            release-files/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-  
+          
+      - name: Upload to Existing Release (for release events)
+        uses: softprops/action-gh-release@v2
+        if: ${{ github.event_name == 'release' }}
+        with:
+          tag_name: ${{ github.event.release.tag_name }}
+          files: |
+            release-files/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   release-summary:
     name: Generate Release Summary
     needs: release
     runs-on: ubuntu-latest
-    if: success()
+    if: ${{ always() }}
     
     steps:
       - name: Create Summary
         run: |
-          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
-          # 🎉 Release Build Complete!
-          
-          ## 📦 Built Binaries
-          
-          | Platform | Architecture | Binary Name |
-          |----------|--------------|-------------|
-          | 🐧 Linux | x86_64 | bluecon-*-linux-amd64 |
-          | 🐧 Linux | ARM64 | bluecon-*-linux-arm64 |
-          | 🪟 Windows | x86_64 | bluecon-*-windows-amd64.exe |
-          | 🍎 macOS | Intel | bluecon-*-darwin-amd64 |
-          | 🍎 macOS | Apple Silicon | bluecon-*-darwin-arm64 |
-          
-          ## ✅ Features
-          
-          - Static binaries (no dependencies required)
-          - Alpine Linux compatible
-          - CGO disabled for maximum portability
-          - SHA256 checksums included
-          
-          ## 📥 Installation
-          
-          ### Linux (Ubuntu, Debian, etc)
-          ```bash
-          # Download
-          wget https://github.com/${{ github.repository }}/releases/latest/download/bluecon-*-linux-amd64
-          
-          # Make executable
-          chmod +x bluecon-*-linux-amd64
-          
-          # Move to PATH
-          sudo mv bluecon-*-linux-amd64 /usr/local/bin/bluecon
-          
-          # Verify
-          bluecon --version
-          ```
-          
-          ### Alpine Linux
-          ```bash
-          # Download Bluecon
-          wget https://github.com/${{ github.repository }}/releases/latest/download/bluecon-*-linux-amd64
-          
-          # Make executable
-          chmod +x bluecon-*-linux-amd64
-          
-          # Move to PATH
-          mv bluecon-*-linux-amd64 /usr/local/bin/bluecon
-          
-          # Verify
-          bluecon --version
-          ```
-          
-          ### macOS
-          ```bash
-          # Intel Mac
-          wget https://github.com/${{ github.repository }}/releases/latest/download/bluecon-*-darwin-amd64
-          chmod +x bluecon-*-darwin-amd64
-          sudo mv bluecon-*-darwin-amd64 /usr/local/bin/bluecon
-          
-          # Apple Silicon (M1/M2/M3)
-          wget https://github.com/${{ github.repository }}/releases/latest/download/bluecon-*-darwin-arm64
-          chmod +x bluecon-*-darwin-arm64
-          sudo mv bluecon-*-darwin-arm64 /usr/local/bin/bluecon
-          
-          # Verify
-          bluecon --version
-          ```
-          
-          ### Windows
-          ```powershell
-          # Download bluecon-*-windows-amd64.exe from releases page
-          # Add to PATH or use directly
-          bluecon.exe --version
-          ```
-          
-          ## 🔐 Verify Checksums
-          
-          ```bash
-          # Download binary and checksum
-          wget https://github.com/${{ github.repository }}/releases/latest/download/bluecon-*-linux-amd64
-          wget https://github.com/${{ github.repository }}/releases/latest/download/bluecon-*-linux-amd64.sha256
-          
-          # Verify
-          sha256sum -c bluecon-*-linux-amd64.sha256
-          
-          # Expected output: bluecon-*-linux-amd64: OK
-          ```
-          
-          EOF
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
+# 🎉 Release Build Complete!
+
+## 📦 Built Binaries
+
+| Platform | Architecture | Binary Name |
+|----------|--------------|-------------|
+| 🐧 Linux | x86_64 | \`bluecon-${{ needs.release.outputs.version }}-linux-amd64\` |
+| 🐧 Linux | ARM64 | \`bluecon-${{ needs.release.outputs.version }}-linux-arm64\` |
+| 🪟 Windows | x86_64 | \`bluecon-${{ needs.release.outputs.version }}-windows-amd64.exe\` |
+| 🍎 macOS | Intel | \`bluecon-${{ needs.release.outputs.version }}-darwin-amd64\` |
+| 🍎 macOS | Apple Silicon | \`bluecon-${{ needs.release.outputs.version }}-darwin-arm64\` |
+
+## ✅ Features
+
+- Static binaries (no dependencies required)
+- Alpine Linux compatible
+- CGO disabled for maximum portability
+- SHA256 checksums included
+
+## 📥 Installation
+
+### Linux (Ubuntu, Debian, etc)
+\`\`\`bash
+# Download
+wget https://github.com/${{ github.repository }}/releases/latest/download/bluecon-${{ needs.release.outputs.version }}-linux-amd64
+
+# Make executable
+chmod +x bluecon-${{ needs.release.outputs.version }}-linux-amd64
+
+# Move to PATH
+sudo mv bluecon-${{ needs.release.outputs.version }}-linux-amd64 /usr/local/bin/bluecon
+
+# Verify
+bluecon --version
+\`\`\`
+
+### Alpine Linux
+\`\`\`bash
+wget https://github.com/${{ github.repository }}/releases/latest/download/bluecon-${{ needs.release.outputs.version }}-linux-amd64
+chmod +x bluecon-${{ needs.release.outputs.version }}-linux-amd64
+mv bluecon-${{ needs.release.outputs.version }}-linux-amd64 /usr/local/bin/bluecon
+bluecon --version
+\`\`\`
+
+### macOS
+\`\`\`bash
+# Intel Mac
+wget https://github.com/${{ github.repository }}/releases/latest/download/bluecon-${{ needs.release.outputs.version }}-darwin-amd64
+chmod +x bluecon-${{ needs.release.outputs.version }}-darwin-amd64
+sudo mv bluecon-${{ needs.release.outputs.version }}-darwin-amd64 /usr/local/bin/bluecon
+
+# Apple Silicon (M1/M2/M3)
+wget https://github.com/${{ github.repository }}/releases/latest/download/bluecon-${{ needs.release.outputs.version }}-darwin-arm64
+chmod +x bluecon-${{ needs.release.outputs.version }}-darwin-arm64
+sudo mv bluecon-${{ needs.release.outputs.version }}-darwin-arm64 /usr/local/bin/bluecon
+
+bluecon --version
+\`\`\`
+
+### Windows
+Download \`bluecon-${{ needs.release.outputs.version }}-windows-amd64.exe\` from the [releases page](https://github.com/${{ github.repository }}/releases/latest) and run directly.
+
+## 🔐 Verify Checksums
+
+\`\`\`bash
+wget https://github.com/${{ github.repository }}/releases/latest/download/bluecon-${{ needs.release.outputs.version }}-linux-amd64
+wget https://github.com/${{ github.repository }}/releases/latest/download/bluecon-${{ needs.release.outputs.version }}-linux-amd64.sha256
+sha256sum -c bluecon-${{ needs.release.outputs.version }}-linux-amd64.sha256
+# Expected: bluecon-${{ needs.release.outputs.version }}-linux-amd64: OK
+\`\`\`
+EOF
